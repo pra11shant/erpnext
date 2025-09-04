@@ -197,3 +197,116 @@ class TestItemWiseSalesRegister(AccountsTestMixin, FrappeTestCase):
 		with patch("frappe.db.sql", return_value=[[123]]):
 			val = report.get_grand_total(filters, "Sales Invoice")
 			assert val == 123.0
+	
+	def test_get_tax_accounts_all_branches(self):
+		from unittest.mock import patch, MagicMock
+		fake_item1 = frappe._dict({
+			"parent": "INV-001",
+			"item_code": "ITEM-001",
+			"item_name": "Item One",
+			"name": "ROW-1",
+			"base_net_amount": 100,
+			"base_net_total": 100,
+		})
+		fake_item2 = frappe._dict({
+			"parent": "INV-002",
+			"item_code": "ITEM-002",
+			"item_name": "Item Two",
+			"name": "ROW-2",
+			"base_net_amount": 200,
+			"base_net_total": 200,
+		})
+		fake_item3 = frappe._dict({
+			"parent": "INV-003",
+			"item_code": "ITEM-003",
+			"item_name": "Item Three",
+			"name": "ROW-3",
+			"base_net_amount": 150,
+			"base_net_total": 150,
+		})
+		fake_item4 = frappe._dict({
+			"parent": "INV-004",
+			"item_code": "ITEM-004",
+			"item_name": "Item Four",
+			"name": "ROW-4",
+			"base_net_amount": 250,
+			"base_net_total": 250,
+		})
+
+		# SQL side effect to simulate different scenarios per invoice
+		def fake_sql(query, *args, **kwargs):
+			qstr = str(query)
+			if "from `tabSales Taxes and Charges`" in qstr:
+				return [
+					# Case 1: Valid JSON list → covers 613 → 629
+					(
+						"TAX-1", "INV-001", "GST 18%", '{"ITEM-001": [18, 18]}',
+						"Tax Account", "Actual", "Add", 18.0
+					),
+					# Case 2: Valid JSON dict + no tax_rate (force 637)
+					(
+						"TAX-2", "INV-002", "CESS", '{"ITEM-002": 0}',
+						"Tax Account", "Actual", "Add", 0
+					),
+					# Case 3: Invalid JSON → ValueError
+					(
+						"TAX-3", "INV-003", "VAT", "{bad json}",
+						"Tax Account", "On Net Total", "Add", 10.0
+					),
+					# Case 4: No item_wise_tax_detail but charge_type=Actual and tax_amount
+					(
+						"TAX-4", "INV-004", "Service Tax", "",
+						"Tax Account", "Actual", "Add", 25.0
+					),
+				]
+			elif "from `tabAccount`" in qstr:
+				return [("Tax Account",)]
+			return []
+
+		# Fake meta
+		fake_meta = MagicMock()
+		fake_meta.get_field.return_value = MagicMock()
+
+		with patch("frappe.db.sql", side_effect=fake_sql), \
+			patch("frappe.get_meta", return_value=fake_meta):
+
+			itemised_tax, tax_cols = report.get_tax_accounts(
+				[fake_item1, fake_item2, fake_item3, fake_item4], [], "INR"
+			)
+
+
+		self.assertIn("GST 18%", tax_cols)
+		self.assertEqual(itemised_tax["ROW-1"]["GST 18%"]["tax_rate"], 18)
+
+		self.assertIn("VAT", tax_cols)  
+
+		self.assertIn("Service Tax", tax_cols)
+		self.assertEqual(itemised_tax["ROW-4"]["Service Tax"]["tax_rate"], "NA")
+
+	def test_get_items_with_additional_query_columns(self):
+		"""Covers: additional_query_columns with and without _doctype"""
+		si = frappe.qb.DocType("Sales Invoice")
+
+		# Fake return data from frappe.db.sql
+		fake_row = {"name": "ROW-1", "parent": "INV-001", "item_code": "ITEM-001"}
+		with patch("frappe.db.sql", return_value=[fake_row]) as mock_sql, \
+		     patch("frappe.desk.reportview.build_match_conditions", return_value=""):
+			
+			# Case 1: additional_query_columns with _doctype
+			additional_columns = [{"_doctype": "Sales Invoice", "fieldname": "remarks"}]
+			items = report.get_items(
+				filters=frappe._dict({"company": self.company}),
+				additional_query_columns=additional_columns,
+			)
+			assert isinstance(items, list)
+			assert items[0]["item_code"] == "ITEM-001"
+			mock_sql.assert_called()
+
+			# Case 2: additional_query_columns without _doctype
+			additional_columns = [{"fieldname": "posting_date"}]
+			items = report.get_items(
+				filters=frappe._dict({"company": self.company}),
+				additional_query_columns=additional_columns,
+			)
+			assert isinstance(items, list)
+			assert items[0]["name"] == "ROW-1"
